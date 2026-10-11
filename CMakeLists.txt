@@ -68,14 +68,14 @@ set(PACKAGE_CONTACT "Paul")
 set(PACKAGE "xgrib_pi")
 set(SHORT_DESCRIPTION "Display, download, and generate environmental GRIB files.")
 set(LONG_DESCRIPTION
-    "A catalogue-installable GRIB viewer with integrated generation of combined weather, wave, and current GRIB files using an isolated native helper."
+    "A catalogue-installable GRIB viewer with integrated generation of combined weather, wave, and current GRIB files using an isolated native helper. Disable bundled GRIB before enabling xGRIB, then restart OpenCPN. Requires OpenCPN with plugin API 1.21 and a matching platform package."
 )
 
 set(VERSION_MAJOR "0")
 set(VERSION_MINOR "3")
-set(VERSION_PATCH "4")
+set(VERSION_PATCH "9")
 set(VERSION_TWEAK "0")
-set(VERSION_DATE "30/09/2026") # DD/MM/YYYY format
+set(VERSION_DATE "07/10/2026") # DD/MM/YYYY format
 set(OCPN_MIN_VERSION "ov511")
 
 set(OCPN_API_VERSION_MAJOR "1")
@@ -166,9 +166,9 @@ message(STATUS "${CMLOC}Build type: ${CMAKE_BUILD_TYPE}")
 project(${PACKAGE})
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Android")
-  set(SHORT_DESCRIPTION "Display, download and combine GRIB files on Android.")
+  set(SHORT_DESCRIPTION "Display, download and generate GRIB files on Android.")
   set(LONG_DESCRIPTION
-      "An Android GRIB viewer with local file selection, forecast downloads and on-tablet combination of weather, wave and current GRIB files. Provider-based environmental generation is available on desktop platforms only.")
+      "An Android GRIB viewer with local file selection, forecast downloads and on-tablet generation and combination of weather, wave and current GRIB files using the shared native generator and provider adapters.")
   set(XML_SUMMARY ${SHORT_DESCRIPTION})
   set(XML_DESCRIPTION ${LONG_DESCRIPTION})
 endif()
@@ -178,6 +178,10 @@ set(CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 # ========================================================
 
 include("PluginSetup")
+if(MSVC AND CMAKE_SIZEOF_VOID_P EQUAL 4)
+  string(APPEND LONG_DESCRIPTION
+    " The Windows x86 plugin requires a 64-bit Windows system for its separate native generator.")
+endif()
 
 # ========================================================
 # ----- Above sets up standard variables required by CMAKE - Do not remove
@@ -338,6 +342,7 @@ set(SRC ${SRCS} ${HDRS})
 include_directories(BEFORE ${PROJECT_SOURCE_DIR}/include)
 include_directories(BEFORE ${PROJECT_SOURCE_DIR}/ocpninclude)
 include_directories(BEFORE ${PROJECT_SOURCE_DIR}/src)
+include_directories(${PROJECT_SOURCE_DIR}/generator/include)
 if(QT_ANDROID)
   include_directories(BEFORE ${PROJECT_SOURCE_DIR}/opencpn-libs/plugin_dc/glu/include)
   if(NOT EXISTS "${OCPN_ANDROID_CORE_SOURCE}/libs/android_jvm/include/android_jvm.h")
@@ -358,6 +363,8 @@ if(QT_ANDROID)
   add_subdirectory(generator)
   target_link_libraries(${PACKAGE_NAME} environmental_grib_engine)
   target_link_options(${PACKAGE_NAME} PRIVATE "-Wl,--exclude-libs,ALL")
+  target_link_options(${PACKAGE_NAME} PRIVATE
+    "-Wl,-z,max-page-size=16384" "-Wl,-z,common-page-size=16384")
 endif()
 
 # The generator is a separate native process.  Keeping it out of the plugin
@@ -384,6 +391,9 @@ if(XGRIB_EXTERNAL_GENERATOR_DIR)
     "${CMLOC}Using external environmental GRIB generator: ${XGRIB_EXTERNAL_GENERATOR}")
 else()
 
+# Windows uses ecCodes' vcpkg CMake config in generator/CMakeLists.txt.
+# Only Unix needs the pkg-config path repair and legacy constructor probe.
+if(NOT WIN32)
 # Debian 12's ecCodes package expands its multiarch pkg-config prefix to
 # /usr/lib instead of /usr. CMake rejects the resulting /usr/lib/include path
 # before compiling, although the headers are correctly installed in
@@ -424,9 +434,10 @@ check_cxx_symbol_exists(codes_handle_new_from_samples "eccodes.h"
                         XGRIB_HAVE_CODES_HANDLE_NEW_FROM_SAMPLES)
 unset(CMAKE_REQUIRED_INCLUDES)
 unset(CMAKE_REQUIRED_LIBRARIES)
+endif()
 
 add_subdirectory(generator EXCLUDE_FROM_ALL)
-if(NOT XGRIB_HAVE_CODES_HANDLE_NEW_FROM_SAMPLES)
+if(NOT WIN32 AND NOT XGRIB_HAVE_CODES_HANDLE_NEW_FROM_SAMPLES)
   target_compile_definitions(environmental_grib_engine PRIVATE
     codes_handle_new_from_samples=grib_handle_new_from_samples)
   message(STATUS "${CMLOC}Using legacy ecCodes sample constructor")
@@ -437,12 +448,18 @@ if(NOT XGRIB_EXTERNAL_GENERATOR_DIR)
   add_dependencies(${PACKAGE_NAME} environmental-grib)
 endif()
 if(BUILD_TESTING AND TARGET environmental_grib_tests)
+  add_dependencies(${PACKAGE_NAME} environmental_grib_gfs_fallback_tests)
   add_dependencies(${PACKAGE_NAME} environmental_grib_cancellation_tests)
   add_dependencies(${PACKAGE_NAME} environmental_grib_estimate_tests)
+  add_dependencies(${PACKAGE_NAME} environmental_grib_preflight_tests)
+  add_dependencies(${PACKAGE_NAME} environmental_grib_request_validation_tests)
   add_dependencies(${PACKAGE_NAME} environmental_grib_tests)
 endif()
 if(BUILD_TESTING AND TARGET environmental_grib_xtd_tests)
   add_dependencies(${PACKAGE_NAME} environmental_grib_xtd_tests)
+endif()
+if(BUILD_TESTING AND TARGET environmental_grib_dateline_tests)
+  add_dependencies(${PACKAGE_NAME} environmental_grib_dateline_tests)
 endif()
 if(BUILD_TESTING AND TARGET environmental_grib_merge_tests)
   add_dependencies(${PACKAGE_NAME} environmental_grib_merge_tests)
@@ -687,6 +704,11 @@ if (NOT OCPN_FLATPAK_CONFIG)
       ${wxWidgets_LIBRARIES})
     add_test(NAME xgrib_process_command_tests
              COMMAND xgrib_process_command_tests)
+    add_test(NAME xgrib_windows_eccodes_configure
+      COMMAND ${CMAKE_COMMAND}
+        -DSOURCE_FILE=${CMAKE_CURRENT_SOURCE_DIR}/CMakeLists.txt
+        -DTEST_BINARY_DIR=${CMAKE_CURRENT_BINARY_DIR}
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/test/WindowsEcCodesConfigureTests.cmake)
 
     add_test(NAME xgrib_environmental_process_output_contract
       COMMAND ${CMAKE_COMMAND}
@@ -841,6 +863,17 @@ if (NOT OCPN_FLATPAK_CONFIG)
           --tonga)
       set_tests_properties(xgrib_tonga_reader_tests PROPERTIES
         FIXTURES_REQUIRED environmental_grib_combined_fixture)
+    endif()
+    if(XGRIB_EXTERNAL_GENERATOR_DIR)
+      add_test(NAME xgrib_dateline_reader_tests
+        COMMAND xgrib_reader_integration_tests
+          "${CMAKE_CURRENT_SOURCE_DIR}/test/fixtures/dateline-combined.grb" --dateline)
+    else()
+      add_test(NAME xgrib_dateline_reader_tests
+        COMMAND xgrib_reader_integration_tests
+          "${CMAKE_BINARY_DIR}/functional-fixtures/dateline/reader.grb" --dateline)
+      set_tests_properties(xgrib_dateline_reader_tests PROPERTIES
+        FIXTURES_REQUIRED environmental_grib_dateline_fixture)
     endif()
   endif()
 

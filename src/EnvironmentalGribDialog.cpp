@@ -5,6 +5,7 @@
 #include "GeneratorJobJson.h"
 #include "ProcessCommand.h"
 #include "XgribPaths.h"
+#include "environmental_grib/area_validation.h"
 
 #include <wx/config.h>
 #include <wx/datetime.h>
@@ -12,6 +13,7 @@
 #include <wx/filedlg.h>
 #include <wx/filename.h>
 #include <wx/msgdlg.h>
+#include <wx/choicdlg.h>
 #include <wx/process.h>
 #include <wx/scrolwin.h>
 #include <wx/stdpaths.h>
@@ -34,6 +36,30 @@
 #endif
 
 namespace {
+
+bool ReadAreaCoordinates(wxTextCtrl* const controls[4], double values[4],
+                         wxString* error, wxTextCtrl** invalid = nullptr) {
+  for (int i = 0; i < 4; ++i) {
+    wxString text = controls[i]->GetValue();
+    text.Trim(true).Trim(false);
+    const wxString label = wxString::FromUTF8(environmental_grib::AreaCoordinateLabel(
+        static_cast<environmental_grib::AreaCoordinate>(i)));
+    if (text.empty() || !text.ToDouble(&values[i]) || !std::isfinite(values[i])) {
+      if (error) *error = text.empty() ? wxString("Enter ") + label + "."
+                                     : label + " must be a finite number.";
+      if (invalid) *invalid = controls[i];
+      return false;
+    }
+  }
+  const auto issue = environmental_grib::ValidateDownloadArea(
+      values[0], values[1], values[2], values[3]);
+  if (issue.message) {
+    if (error) *error = wxString::FromUTF8(issue.message);
+    if (invalid) *invalid = controls[static_cast<int>(issue.field)];
+    return false;
+  }
+  return true;
+}
 
 wxString DefaultOutputDirectory() {
   wxFileName path(wxStandardPaths::Get().GetUserDataDir(), "");
@@ -329,6 +355,7 @@ EnvironmentalGribDialog::EnvironmentalGribDialog(wxWindow* parent,
       m_processTimer(this),
       m_estimateTimer(this),
       m_onGribReady(std::move(onGribReady)) {
+  wxLogMessage("xGRIB: constructing environmental generator dialog");
   auto* top = new wxBoxSizer(wxVERTICAL);
   m_scrolled =
       new wxScrolledWindow(this, wxID_ANY, wxDefaultPosition, wxDefaultSize,
@@ -342,6 +369,7 @@ EnvironmentalGribDialog::EnvironmentalGribDialog(wxWindow* parent,
   grid->AddGrowableCol(1, 1);
 
   m_generatorPath = new wxTextCtrl(scrolled, wxID_ANY, FindDefaultGenerator());
+  wxLogMessage("xGRIB: environmental generator path resolved");
   m_west = new wxTextCtrl(scrolled, wxID_ANY, "-8.5");
   m_south = new wxTextCtrl(scrolled, wxID_ANY, "50.5");
   m_east = new wxTextCtrl(scrolled, wxID_ANY, "-2.5");
@@ -601,6 +629,8 @@ EnvironmentalGribDialog::EnvironmentalGribDialog(wxWindow* parent,
                          wxTE_MULTILINE | wxTE_READONLY | wxTE_DONTWRAP);
   m_log->SetMinSize(wxSize(300, 100));
   top->Add(m_log, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP | wxBOTTOM, 12);
+  m_processStatus = new wxStaticText(this, wxID_ANY, _("Ready"));
+  top->Add(m_processStatus, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 12);
 
   auto* buttons = new wxBoxSizer(wxHORIZONTAL);
   m_checkButton = new wxButton(this, wxID_ANY, "Check Dependencies");
@@ -707,12 +737,15 @@ EnvironmentalGribDialog::EnvironmentalGribDialog(wxWindow* parent,
   wxLogMessage("xGRIB environmental generator executable: %s",
                m_generatorPath->GetValue());
   LoadSettings();
+  wxLogMessage("xGRIB: environmental generator settings loaded");
   ConfigureSmokeTestFromEnvironment();
   UpdateSelectedPathDisplays();
   ValidateOfflineTidalPackage();
+  wxLogMessage("xGRIB: environmental generator offline package check complete");
   RefreshOutputFilenameDefault();
   UpdateProviderUi();
   SetBusy(false);
+  wxLogMessage("xGRIB: environmental generator dialog ready");
 }
 
 void EnvironmentalGribDialog::ConfigureSmokeTestFromEnvironment() {
@@ -790,7 +823,7 @@ void EnvironmentalGribDialog::PrepareForParentShutdown() {
   m_processTimer.Stop();
   if (m_processRunning && m_processPid != 0 && ChildProcessStillExists()) {
     wxKillError error = wxKILL_OK;
-    wxKill(m_processPid, wxSIGTERM, &error, wxKILL_CHILDREN);
+    xgrib::TerminateGeneratorProcess(m_processPid, &error);
     wxLogMessage(
         "xGRIB: stopped environmental generator pid=%ld during shutdown "
         "(wxKillError=%d)",
@@ -836,6 +869,7 @@ void EnvironmentalGribDialog::OnCheckTpxoModel(wxCommandEvent&) {
 }
 
 void EnvironmentalGribDialog::OnPrepareTpxoCache(wxCommandEvent&) {
+  if (!ValidateAreaInput()) return;
   wxFileName cachePath(m_tpxoCacheFile->GetPath());
   if (cachePath.GetFullPath().empty()) {
     wxString message =
@@ -870,7 +904,67 @@ void EnvironmentalGribDialog::OnPrepareTpxoCache(wxCommandEvent&) {
   StartCommand(command, "", false);
 }
 
+bool EnvironmentalGribDialog::ChooseTimeOptions(const wxString& issue_json) {
+  wxJSONValue issue;
+  wxJSONReader reader;
+  if (reader.Parse(issue_json, &issue) != 0) return false;
+  wxString message = issue["message"].AsString();
+  auto coverage = issue["coverage"];
+  // Show actual field ranges rather than a component union that can hide
+  // the field restricting a proposed shared period.
+  for (int i = 0; i < coverage.Size(); ++i) {
+    auto entry = coverage.ItemAt(i);
+    AppendLog(entry["component"].AsString() + " " + entry["field"].AsString() +
+              ": " + entry["fromUtc"].AsString() + " to " + entry["throughUtc"].AsString());
+  }
+  if (issue.HasMember("coverageSummary"))
+    message += "\n\nField coverage (UTC):\n" + issue["coverageSummary"].AsString();
+  wxArrayString labels;
+  auto actions = issue["actions"];
+  for (int i = 0; i < actions.Size(); ++i) labels.Add(actions.ItemAt(i)["label"].AsString());
+  labels.Add("Change settings");
+  wxSingleChoiceDialog dialog(this, message, "Forecast time options", labels);
+  // Remedies can shorten a forecast or remove sources. Require an explicit
+  // selection rather than defaulting to a destructive change.
+  dialog.SetSelection(actions.Size());
+  if (dialog.ShowModal() != wxID_OK || dialog.GetSelection() >= actions.Size()) return false;
+  auto patch = actions.ItemAt(dialog.GetSelection())["request"];
+  if (patch.HasMember("hours")) m_durationHours->SetValue(patch["hours"].AsInt());
+  if (patch.HasMember("stepHours")) m_stepHours->SetValue(patch["stepHours"].AsInt());
+  if (patch.HasMember("weatherProvider")) m_generateWeather->SetValue(false);
+  if (patch.HasMember("currentSource")) m_generateCurrents->SetValue(false);
+  if (patch.HasMember("includeWaves")) m_includeWaves->SetValue(patch["includeWaves"].AsBool());
+  m_timePolicy = patch.HasMember("timePolicy") ? patch["timePolicy"].AsString() : wxString("review");
+  m_timeSettingsIssue.clear();
+  AppendLog("Time option selected: " + dialog.GetStringSelection());
+  UpdateProviderUi();
+  return true;
+}
+
+bool EnvironmentalGribDialog::ValidateAreaInput() {
+  wxTextCtrl* controls[] = {m_west, m_south, m_east, m_north};
+  double values[4]{};
+  wxString error;
+  wxTextCtrl* invalid = nullptr;
+  if (ReadAreaCoordinates(controls, values, &error, &invalid)) return true;
+  AppendLog("Invalid download area: " + error);
+  wxMessageBox(error + "\n\nEnter the four area coordinates, use the current chart area, or select a saved area preset.",
+               "Invalid download area", wxOK | wxICON_WARNING, this);
+  if (invalid) { invalid->SetFocus(); invalid->SelectAll(); }
+  return false;
+}
+
 void EnvironmentalGribDialog::OnGenerate(wxCommandEvent&) {
+  struct ResetTimeConsent {
+    wxString& policy;
+    ~ResetTimeConsent() { policy = "review"; }
+  } resetTimeConsent{m_timePolicy};
+  if (!ValidateAreaInput()) return;
+  // Already computed alongside the debounced, offline size estimate. Never
+  // wait for this cache: the generation worker repeats validation before HTTP.
+  if (m_timeSettingsRevision == m_estimateRevision && !m_timeSettingsIssue.empty()) {
+    if (!ChooseTimeOptions(m_timeSettingsIssue)) return;
+  }
   int mode = m_mode->GetSelection();
   wxString provider = m_provider->GetStringSelection();
   wxString weatherProvider = m_weatherProvider->GetStringSelection();
@@ -966,11 +1060,6 @@ void EnvironmentalGribDialog::OnGenerate(wxCommandEvent&) {
     AppendLog("Generation cancelled before launch.");
     return;
   }
-  if (m_generateWeather->GetValue() && weatherProvider.Contains("ECMWF") &&
-      !ValidateEcmwfRequest()) {
-    AppendLog("Generation cancelled before launch.");
-    return;
-  }
   if (m_generateWeather->GetValue() && (weatherProvider.Contains("HRRR") ||
                                         weatherProvider.Contains("ICON-EU"))) {
     double west = 0.0;
@@ -982,7 +1071,7 @@ void EnvironmentalGribDialog::OnGenerate(wxCommandEvent&) {
                   m_east->GetValue().ToDouble(&east) &&
                   m_north->GetValue().ToDouble(&north);
     if (parsed && weatherProvider.Contains("HRRR") &&
-        (west < -130.0 || east > -60.0 || south < 20.0 || north > 55.0)) {
+        (west > east || west < -130.0 || east > -60.0 || south < 20.0 || north > 55.0)) {
       wxString message =
           "The requested bbox is outside the normal NOAA HRRR contiguous "
           "United States domain. "
@@ -994,7 +1083,7 @@ void EnvironmentalGribDialog::OnGenerate(wxCommandEvent&) {
       return;
     }
     if (parsed && weatherProvider.Contains("ICON-EU") &&
-        (west < -32.5 || east > 42.5 || south < 20.0 || north > 72.5)) {
+        (west > east || west < -32.5 || east > 42.5 || south < 20.0 || north > 72.5)) {
       wxString message =
           "The requested bbox is outside the normal DWD ICON-EU Europe domain. "
           "Choose a European area or select a global provider that covers this "
@@ -1023,6 +1112,7 @@ void EnvironmentalGribDialog::OnGenerate(wxCommandEvent&) {
     }
   }
   wxString command = BuildGenerateCommand();
+  m_timePolicy = "review";  // Consent applies to this job only.
   if (command.empty()) {
     AppendLog(
         "Generation cancelled: native generator job could not be created.");
@@ -1203,10 +1293,11 @@ void EnvironmentalGribDialog::ApplyPreset(int selection) {
       m_presetChoice->SetSelection(0);
       return;
     }
-    if (m_currentViewPort.lon_min >= m_currentViewPort.lon_max ||
+    double chartWest = m_currentViewPort.lon_min, chartEast = m_currentViewPort.lon_max;
+    if (!xgrib::NormalizeAreaLongitudes(&chartWest, &chartEast) ||
         m_currentViewPort.lat_min >= m_currentViewPort.lat_max) {
       AppendLog(
-          "Current chart area crosses an unsupported longitude boundary; enter "
+          "Current chart area has invalid bounds; enter "
           "bbox manually.");
       wxMessageBox(
           "The current chart area cannot be converted to a simple "
@@ -1216,9 +1307,9 @@ void EnvironmentalGribDialog::ApplyPreset(int selection) {
       return;
     }
     m_applyingAreaPreset = true;
-    m_west->ChangeValue(wxString::Format("%.6f", m_currentViewPort.lon_min));
+    m_west->ChangeValue(wxString::Format("%.6f", chartWest));
     m_south->ChangeValue(wxString::Format("%.6f", m_currentViewPort.lat_min));
-    m_east->ChangeValue(wxString::Format("%.6f", m_currentViewPort.lon_max));
+    m_east->ChangeValue(wxString::Format("%.6f", chartEast));
     m_north->ChangeValue(wxString::Format("%.6f", m_currentViewPort.lat_max));
     m_applyingAreaPreset = false;
     RefreshOutputFilenameDefault();
@@ -1257,7 +1348,7 @@ bool EnvironmentalGribDialog::AutoWouldUseMarineIe() const {
                 m_south->GetValue().ToDouble(&south) &&
                 m_east->GetValue().ToDouble(&east) &&
                 m_north->GetValue().ToDouble(&north);
-  return parsed && west >= -6.994 && east <= -4.006 && south >= 51.506 &&
+  return parsed && west < east && west >= -6.994 && east <= -4.006 && south >= 51.506 &&
          north <= 55.494 && m_durationHours->GetValue() <= 72;
 }
 
@@ -1379,8 +1470,8 @@ bool EnvironmentalGribDialog::ValidateOfflineTidalPackage() {
       m_east->GetValue().ToDouble(&requestedEast) &&
       m_north->GetValue().ToDouble(&requestedNorth);
   if (haveCoverage && haveRequestedArea &&
-      (requestedWest < coverageWest || requestedSouth < coverageSouth ||
-       requestedEast > coverageEast || requestedNorth > coverageNorth)) {
+      !xgrib::AreaContains({"", "", coverageWest, coverageSouth, coverageEast, coverageNorth},
+                          {"", "", requestedWest, requestedSouth, requestedEast, requestedNorth})) {
     m_offlineTidalStatus->SetValue(wxString::Format(
         _("Requested area outside coverage: package covers %.4f, %.4f to %.4f, "
           "%.4f"),
@@ -1789,7 +1880,7 @@ bool EnvironmentalGribDialog::ConfirmLargeCopernicusRequest() {
                 m_south->GetValue().ToDouble(&south) &&
                 m_east->GetValue().ToDouble(&east) &&
                 m_north->GetValue().ToDouble(&north);
-  double area = parsed ? (east - west) * (north - south) : 0.0;
+  double area = parsed ? (east > west ? east - west : east + 360.0 - west) * (north - south) : 0.0;
   if (m_durationHours->GetValue() <= 72 && area <= 12.0) {
     return true;
   }
@@ -1804,17 +1895,6 @@ bool EnvironmentalGribDialog::ConfirmLargeCopernicusRequest() {
 }
 
 bool EnvironmentalGribDialog::ValidateUkvRequest() {
-  if (m_stepHours->GetValue() == 1 && m_durationHours->GetValue() > 54) {
-    wxString message =
-        "Met Office UKV is hourly to about 54h, then 3-hourly to 120h.\n"
-        "Continue with mixed-cadence UKV weather?\n"
-        "Currents will remain at the selected interval where supported.";
-    AppendLog(message);
-    if (wxMessageBox(message, "Confirm mixed-cadence UKV weather",
-                     wxYES_NO | wxICON_WARNING, this) != wxYES) {
-      return false;
-    }
-  }
   double west = 0.0;
   double south = 0.0;
   double east = 0.0;
@@ -1823,7 +1903,7 @@ bool EnvironmentalGribDialog::ValidateUkvRequest() {
       m_south->GetValue().ToDouble(&south) &&
       m_east->GetValue().ToDouble(&east) &&
       m_north->GetValue().ToDouble(&north)) {
-    if (west < -12.0 || east > 4.0 || south < 48.0 || north > 62.0) {
+    if (west > east || west < -12.0 || east > 4.0 || south < 48.0 || north > 62.0) {
       wxString message =
           "The requested bbox is outside the Met Office UKV UK/Ireland "
           "regional domain. Choose a UK/Ireland area or use GFS/ECMWF.";
@@ -1837,25 +1917,6 @@ bool EnvironmentalGribDialog::ValidateUkvRequest() {
 }
 
 bool EnvironmentalGribDialog::ValidateMetNoRequest() {
-  const int step = m_stepHours->GetValue();
-  if (step != 1 && step != 3 && step != 6 && step != 12) {
-    const wxString message =
-        "MET Norway weather is available at 1, 3, 6, or 12-hour steps. "
-        "Choose one of those Step hours values.";
-    AppendLog(message);
-    wxMessageBox(message, "MET Norway forecast step unavailable",
-                 wxOK | wxICON_WARNING, this);
-    return false;
-  }
-  if (m_durationHours->GetValue() > 56 && !m_extendForecast->GetValue()) {
-    const wxString message =
-        "MET Norway's compact Nordic forecast covers about 56 hours. Enable "
-        "Forecast extension with NOAA GFS, or shorten the duration.";
-    AppendLog(message);
-    wxMessageBox(message, "MET Norway duration unavailable",
-                 wxOK | wxICON_WARNING, this);
-    return false;
-  }
   double west = 0.0;
   double south = 0.0;
   double east = 0.0;
@@ -1864,7 +1925,7 @@ bool EnvironmentalGribDialog::ValidateMetNoRequest() {
       m_south->GetValue().ToDouble(&south) &&
       m_east->GetValue().ToDouble(&east) &&
       m_north->GetValue().ToDouble(&north) &&
-      (west < -20.0 || east > 80.0 || south < 51.0 || north > 88.0)) {
+      (west > east || west < -20.0 || east > 80.0 || south < 51.0 || north > 88.0)) {
     const wxString message =
         "The requested bbox is outside the MET Norway Nordic forecast domain. "
         "Choose a Nordic/European area or use a global provider.";
@@ -1873,40 +1934,6 @@ bool EnvironmentalGribDialog::ValidateMetNoRequest() {
                  wxOK | wxICON_WARNING, this);
     return false;
   }
-  return true;
-}
-
-bool EnvironmentalGribDialog::ValidateEcmwfRequest() {
-  wxString weatherProvider = m_weatherProvider->GetStringSelection();
-  int stepHours = m_stepHours->GetValue();
-  bool aifs = weatherProvider.Contains("AIFS");
-  bool valid = aifs ? (stepHours == 6 || stepHours == 12)
-                    : (stepHours == 3 || stepHours == 6 || stepHours == 12);
-  if (valid) {
-    return true;
-  }
-
-  int replacementStepHours = aifs ? 6 : 3;
-  wxString providerName = aifs ? "ECMWF AIFS Open Data" : "ECMWF IFS Open Data";
-  wxString message = providerName + " is available at " +
-                     (aifs ? "6-hourly or coarser intervals."
-                           : "3-hourly or coarser intervals.") +
-                     "\nChange Step hours to " +
-                     wxString::Format("%d", replacementStepHours) +
-                     " and continue?";
-  AppendLog(message);
-
-  wxMessageDialog dialog(this, message, "Confirm ECMWF forecast step",
-                         wxYES_NO | wxICON_WARNING);
-  dialog.SetYesNoLabels(
-      wxString::Format("Continue with %dh", replacementStepHours), "Cancel");
-  if (dialog.ShowModal() != wxID_YES) {
-    return false;
-  }
-
-  m_stepHours->SetValue(replacementStepHours);
-  AppendLog(wxString::Format("Step hours changed to %d for %s.",
-                             replacementStepHours, providerName));
   return true;
 }
 
@@ -1927,7 +1954,7 @@ void EnvironmentalGribDialog::OnCancel(wxCommandEvent&) {
   m_processCancelled = true;
   AppendLog(wxString::Format("Cancelling process, pid=%ld", m_processPid));
   wxKillError error = wxKILL_OK;
-  wxKill(m_processPid, wxSIGTERM, &error, wxKILL_CHILDREN);
+  xgrib::TerminateGeneratorProcess(m_processPid, &error);
   if (error != wxKILL_OK) {
     AppendLog(wxString::Format("Process cancel request returned wxKillError=%d",
                                static_cast<int>(error)));
@@ -1977,6 +2004,14 @@ void EnvironmentalGribDialog::OnDialogClose(wxCloseEvent& event) {
 void EnvironmentalGribDialog::OnProcessTimer(wxTimerEvent& event) {
   (void)event;
   DrainProcessOutput();
+  if (m_processRunning) {
+    const long seconds = ((wxGetUTCTimeMillis() - m_processStarted) / 1000).ToLong();
+    const wxString status = wxString::Format(
+        m_processCancelled ? _("Cancelling helper (pid %ld), %ld seconds elapsed")
+                           : _("Running helper (pid %ld), %ld seconds elapsed"),
+        m_processPid, seconds);
+    if (m_processStatus->GetLabel() != status) m_processStatus->SetLabel(status);
+  }
   if (m_processRunning && m_processPid != 0 && !ChildProcessStillExists()) {
     AppendLog(
         wxString::Format("Process pid=%ld is no longer running; finalizing "
@@ -2121,6 +2156,12 @@ void EnvironmentalGribDialog::FinishEstimate(long exit_code) {
                  _("Decoded forecast data: not yet known"));
     return;
   }
+  m_timeSettingsIssue.clear();
+  m_timeSettingsRevision = m_runningEstimateRevision;
+  if (estimate["preflight"]["issues"].Size() > 0) {
+    wxJSONWriter writer;
+    writer.Write(estimate["preflight"]["issues"].ItemAt(0), m_timeSettingsIssue);
+  }
   auto mib = [&](const wxString& key) {
     double value = 0;
     estimate[key].AsString().ToDouble(&value);
@@ -2162,7 +2203,7 @@ void EnvironmentalGribDialog::OnProcessTerminated(wxProcessEvent& event) {
                              static_cast<int>(event.GetPid())));
   DrainProcessOutput();
   FlushProcessOutput();
-  FinishCommand(event.GetExitCode(), true);
+  FinishCommand(event.GetExitCode(), true, true);
 }
 
 void EnvironmentalGribDialog::AppendLog(const wxString& message) {
@@ -2258,8 +2299,9 @@ void EnvironmentalGribDialog::StartCommand(const wxString& command,
   if (samples.DirExists()) env.env["ECCODES_SAMPLES_PATH"] = samples.GetPath();
   if (proj.DirExists()) env.env["PROJ_DATA"] = proj.GetPath();
 
-  long pid = wxExecute(command, wxEXEC_ASYNC | wxEXEC_NODISABLE, process,
-                       &env);
+  long pid = wxExecute(command, wxEXEC_ASYNC | wxEXEC_NODISABLE |
+                                   wxEXEC_HIDE_CONSOLE | wxEXEC_MAKE_GROUP_LEADER,
+                       process, &env);
   if (pid == 0) {
     AppendLog("Process failed to launch");
     wxLogError("xGRIB environmental generator failed to launch");
@@ -2271,6 +2313,8 @@ void EnvironmentalGribDialog::StartCommand(const wxString& command,
   m_process = process;
   m_processRunning = true;
   m_processPid = pid;
+  m_processStarted = wxGetUTCTimeMillis();
+  m_processStatus->SetLabel(wxString::Format(_("Running helper (pid %ld)"), pid));
   AppendLog(wxString::Format("Process launched, pid=%ld", pid));
   wxLogMessage("xGRIB environmental generator launched, pid=%ld", pid);
   if (!m_processTimer.Start(100)) {
@@ -2278,16 +2322,23 @@ void EnvironmentalGribDialog::StartCommand(const wxString& command,
         "Failed to start the process-output monitor; terminating the helper to "
         "avoid an output-pipe deadlock.");
     wxKillError error = wxKILL_OK;
-    wxKill(pid, wxSIGTERM, &error, wxKILL_CHILDREN);
+    xgrib::TerminateGeneratorProcess(pid, &error);
     AppendLog(wxString::Format("Helper termination requested (wxKillError=%d).",
                                static_cast<int>(error)));
   }
 }
 
-void EnvironmentalGribDialog::FinishCommand(long exit_code, bool launched) {
+void EnvironmentalGribDialog::FinishCommand(long exit_code, bool launched,
+                                            bool completion_notified) {
   m_processTimer.Stop();
   if (m_process) {
-    delete m_process;
+    // wxExecute still holds this pointer until it delivers OnTerminate.
+    // Polling can detect exit first; detach and let that notification delete
+    // the object instead of leaving wxExecute with a dangling pointer.
+    if (completion_notified)
+      delete m_process;
+    else
+      m_process->Detach();
     m_process = nullptr;
   }
   AppendLog(wxString::Format("Exit status: %ld", exit_code));
@@ -2312,6 +2363,9 @@ void EnvironmentalGribDialog::FinishCommand(long exit_code, bool launched) {
       wxJSONReader reader;
       if (reader.Parse(resultText, &resultValue) == 0) {
         completedResult = resultValue;
+        const auto warnings = resultValue["result"]["diagnostics"]["warnings"];
+        for (int i = 0; i < warnings.Size(); ++i)
+          AppendLog("Forecast note: " + warnings.ItemAt(i).AsString());
         if (resultValue.HasMember("error") &&
             resultValue["error"].HasMember("message")) {
           nativeError = resultValue["error"]["message"].AsString();
@@ -2405,6 +2459,12 @@ void EnvironmentalGribDialog::FinishCommand(long exit_code, bool launched) {
         "\nOutput: " + OutputPath();
     if (!extensionSummary.empty())
       message += "\n\nActual forecast composition:\n" + extensionSummary;
+    auto timeCoverage = completedResult["result"]["diagnostics"]["time_coverage"];
+    const auto timePolicy = timeCoverage["policy"].AsString();
+    if (timeCoverage["severity"].AsString() == "advisory" &&
+        (timePolicy == "review" || timePolicy == "keep-all"))
+      message += "\n\nCoverage note:\n" + timeCoverage["message"].AsString() +
+                 "\n" + timeCoverage["coverageSummary"].AsString();
     if (m_openAfter->GetValue()) {
       TryOpenGeneratedGrib();
       message += "\n\nThe generated file was opened in xGRIB.";
@@ -2423,10 +2483,19 @@ void EnvironmentalGribDialog::FinishCommand(long exit_code, bool launched) {
           "If this failed while using the NetCDF source grid, retry from the "
           "CLI without --use-source-grid to interpolate to a regular grid.");
     }
-    wxMessageBox(
-        "Environmental GRIB generation failed. See the log/details area for "
-        "command output.",
-        "Generation failed", wxOK | wxICON_ERROR, this);
+    if (completedResult["error"]["code"].AsString() == "preflight_required") {
+      wxString issue;
+      wxJSONWriter writer;
+      writer.Write(completedResult["error"]["preflight"], issue);
+      if (ChooseTimeOptions(issue)) {
+        CallAfter([this] { wxCommandEvent event; OnGenerate(event); });
+      }
+      return;
+    }
+    wxMessageBox(nativeError.empty()
+                     ? wxString("Environmental GRIB generation failed. See the log/details area for command output.")
+                     : Redact(nativeError),
+                 "Generation failed", wxOK | wxICON_ERROR, this);
   }
 }
 
@@ -2438,7 +2507,7 @@ bool EnvironmentalGribDialog::ChildProcessStillExists() const {
   if (errno == ESRCH) return false;
   return true;
 #else
-  return true;
+  return wxProcess::Exists(static_cast<int>(m_processPid));
 #endif
 }
 
@@ -2453,6 +2522,7 @@ bool EnvironmentalGribDialog::OutputFileLooksValidGrib(
 }
 
 void EnvironmentalGribDialog::SetBusy(bool busy) {
+  m_processStatus->SetLabel(busy ? _("Starting helper...") : _("Ready"));
   m_checkButton->Enable(!busy);
   m_generateButton->Enable(!busy);
   m_cancelButton->Enable(busy);
@@ -2482,17 +2552,13 @@ void EnvironmentalGribDialog::TryOpenGeneratedGrib() {
 
 bool EnvironmentalGribDialog::BuildGenerateJobText(wxString* text,
                                                   wxString* error) const {
-  double west = 0.0;
-  double south = 0.0;
-  double east = 0.0;
-  double north = 0.0;
+  wxTextCtrl* controls[] = {m_west, m_south, m_east, m_north};
+  double bounds[4]{};
+  if (!ReadAreaCoordinates(controls, bounds, error)) return false;
+  const double west = bounds[0], south = bounds[1], east = bounds[2], north = bounds[3];
   double currentSpacing = 0.0;
-  if (!m_west->GetValue().ToDouble(&west) ||
-      !m_south->GetValue().ToDouble(&south) ||
-      !m_east->GetValue().ToDouble(&east) ||
-      !m_north->GetValue().ToDouble(&north) ||
-      !m_tpxoGridSpacing->GetValue().ToDouble(&currentSpacing)) {
-    if (error) *error = "area coordinates and grid spacing must be numeric";
+  if (!m_tpxoGridSpacing->GetValue().ToDouble(&currentSpacing)) {
+    if (error) *error = "grid spacing must be numeric";
     return false;
   }
 
@@ -2553,7 +2619,7 @@ bool EnvironmentalGribDialog::BuildGenerateJobText(wxString* text,
     else if (selected.Contains("Auto"))
       currentSource = "auto";
   }
-  if (!IsOfflineTidalSelected()) {
+  if (m_generateCurrents->GetValue() && !IsOfflineTidalSelected()) {
     if (m_mode->GetSelection() == 2) currentSource = "netcdf";
     if (m_mode->GetSelection() == 3) currentSource = "synthetic";
   }
@@ -2574,6 +2640,7 @@ bool EnvironmentalGribDialog::BuildGenerateJobText(wxString* text,
   request["start"] = startUtc;
   request["hours"] = m_durationHours->GetValue();
   request["stepHours"] = m_stepHours->GetValue();
+  request["timePolicy"] = m_timePolicy;
   request["weatherProvider"] = weatherProvider;
   request["extendForecast"] = m_extendForecast->GetValue();
   request["fallbackWeatherProvider"] = wxString(
@@ -2930,7 +2997,7 @@ wxString EnvironmentalGribDialog::DefaultOutputFilenameForSelection() const {
                   m_south->GetValue().ToDouble(&south) &&
                   m_east->GetValue().ToDouble(&east) &&
                   m_north->GetValue().ToDouble(&north);
-    if (parsed && west >= -20.0 && east <= 13.0 && south >= 40.0 &&
+    if (parsed && west < east && west >= -20.0 && east <= 13.0 && south >= 40.0 &&
         north <= 65.0) {
       return TimestampedFilename("copernicus_nws_current");
     }

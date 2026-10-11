@@ -34,6 +34,9 @@
 
 #include <wx/fileconf.h>
 #include <wx/stdpaths.h>
+#ifdef __OCPN__ANDROID__
+#include <wx/imagpng.h>
+#endif
 
 #include <algorithm>
 #include <limits>
@@ -44,6 +47,11 @@
 
 #ifdef __WXQT__
 #include "qdebug.h"
+#endif
+
+#ifdef __OCPN__ANDROID__
+#include <QCoreApplication>
+#include <QEvent>
 #endif
 
 double g_ContentScaleFactor;
@@ -78,6 +86,12 @@ bool g_bpause;
 //---------------------------------------------------------------------------------------------------------
 
 grib_pi::grib_pi(void* ppimgr) : opencpn_plugin_117(ppimgr) {
+#ifdef __OCPN__ANDROID__
+  // Android plugins link a private static wxQt. Its image-handler registry
+  // is separate from the host's, including after a disable/reload cycle.
+  if (!wxImage::FindHandler(wxBITMAP_TYPE_PNG))
+    wxImage::AddHandler(new wxPNGHandler);
+#endif
   // Create the PlugIn icons
   initialize_images();
 
@@ -262,6 +276,12 @@ bool grib_pi::DeInit(void) {
   delete m_pGRIBOverlayFactory;
   m_pGRIBOverlayFactory = nullptr;
 
+#ifdef __OCPN__ANDROID__
+  // wxQt destroys native widgets with deleteLater(). Finish those deletions
+  // before a hot plugin replacement unloads our Qt delegates and event filters.
+  QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+#endif
+
   if (m_jasperInitialized) {
 #if defined(JAS_VERSION_MAJOR) && JAS_VERSION_MAJOR >= 2
     jas_cleanup_thread();
@@ -287,7 +307,11 @@ int grib_pi::GetPlugInVersionPatch() { return PLUGIN_VERSION_PATCH; }
 
 int grib_pi::GetPlugInVersionPost() { return PLUGIN_VERSION_TWEAK; }
 
-wxBitmap* grib_pi::GetPlugInBitmap() { return &m_panelBitmap; }
+wxBitmap* grib_pi::GetPlugInBitmap() {
+  // An incomplete installation must still expose a usable manager icon.
+  // Older wxQt hosts dereference bitmap ref-data without checking IsOk().
+  return m_panelBitmap.IsOk() ? &m_panelBitmap : _img_grib_pi;
+}
 
 wxString grib_pi::GetCommonName() { return "xGRIB"; }
 

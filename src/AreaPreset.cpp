@@ -1,4 +1,5 @@
 #include "AreaPreset.h"
+#include "environmental_grib/area_validation.h"
 
 #include <algorithm>
 #include <cmath>
@@ -103,24 +104,44 @@ const std::vector<ProviderPreferenceOption>& CurrentProviderOptions() {
   return options;
 }
 
+bool NormalizeAreaLongitudes(double* west, double* east) {
+  if (!west || !east || !std::isfinite(*west) || !std::isfinite(*east)) return false;
+  double span = *east - *west;
+  if (span < 0.0 && span > -360.0) span += 360.0;
+  if (span <= 0.0 || span > 360.0) return false;
+  if (std::abs(span - 360.0) < 1e-8) { *west = -180.0; *east = 180.0; return true; }
+  auto normalize = [](double value) {
+    double result = std::fmod(value + 180.0, 360.0);
+    if (result < 0.0) result += 360.0;
+    return result - 180.0;
+  };
+  *west = normalize(*west);
+  *east = normalize(*west + span);
+  return true;
+}
+
+bool AreaContains(const AreaPreset& coverage, const AreaPreset& requested) {
+  double west = coverage.west, east = coverage.east;
+  double requestedWest = requested.west, requestedEast = requested.east;
+  if (!NormalizeAreaLongitudes(&west, &east) ||
+      !NormalizeAreaLongitudes(&requestedWest, &requestedEast)) return false;
+  const double width = east > west ? east - west : east + 360.0 - west;
+  const double requestedWidth = requestedEast > requestedWest ? requestedEast - requestedWest
+                                                               : requestedEast + 360.0 - requestedWest;
+  double offset = std::fmod(requestedWest - west, 360.0);
+  if (offset < 0.0) offset += 360.0;
+  if (offset > 360.0 - 1e-8) offset = 0.0;
+  return (width >= 360.0 - 1e-8 || offset + requestedWidth <= width + 1e-8) &&
+         requested.south >= coverage.south && requested.north <= coverage.north;
+}
+
 wxString ValidateAreaPreset(const AreaPreset& preset) {
   const wxString name = NormalizedName(preset.name);
   if (preset.id.empty()) return "The preset has no internal ID.";
   if (name.empty()) return "Enter a name for the area.";
-  if (!std::isfinite(preset.west) || !std::isfinite(preset.south) ||
-      !std::isfinite(preset.east) || !std::isfinite(preset.north))
-    return "All coordinates must be finite numbers.";
-  if (preset.west < -180.0 || preset.west > 180.0 || preset.east < -180.0 ||
-      preset.east > 180.0)
-    return "Longitudes must be between -180 and 180 degrees.";
-  if (preset.south < -90.0 || preset.south > 90.0 || preset.north < -90.0 ||
-      preset.north > 90.0)
-    return "Latitudes must be between -90 and 90 degrees.";
-  if (preset.west >= preset.east)
-    return "West longitude must be less than east longitude. Areas crossing "
-           "the antimeridian are not yet supported.";
-  if (preset.south >= preset.north)
-    return "South latitude must be less than north latitude.";
+  const auto issue = environmental_grib::ValidateDownloadArea(
+      preset.west, preset.south, preset.east, preset.north);
+  if (issue.message) return wxString::FromUTF8(issue.message);
   if (!IsKnownProviderId(preset.weather_provider, WeatherProviderOptions()))
     return "The preferred weather provider is not available.";
   if (!IsKnownProviderId(preset.current_provider, CurrentProviderOptions()))

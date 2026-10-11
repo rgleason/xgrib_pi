@@ -5,10 +5,94 @@ for OpenCPN. It retains the familiar GRIB timeline, overlays, cursor data,
 download tools and plugin-message protocol, while adding an integrated native
 generator for combined weather, wave and current GRIB files.
 
-The generator runs in a separate process. Provider downloads, NetCDF parsing,
-UKV regridding, current calculation and ecCodes writing therefore do not run
-inside OpenCPN. Generated files open directly in xGRIB after strict GRIB
-validation.
+Desktop builds run the shared generator in a separate process. Android runs
+that same engine on a background worker behind its native touch interface.
+Both paths use the same provider adapters, date-line geometry, UTC handling
+and output validation. Generated files open directly in xGRIB.
+
+### Improved in 0.3.9
+
+Generate checks the area locally before any other prompts or downloads. Missing,
+non-numeric, out-of-range and zero-size coordinates show an immediate message
+and select the coordinate to correct. Custom areas do not need a saved preset;
+valid date-line crossings remain accepted. Desktop and Android use the same
+area rules as the shared generator.
+
+Copernicus sign-in failures distinguish rejected credentials, account actions,
+service outages and unsupported sign-in requests where the service supplies a
+recognised reason. Errors retain the HTTP status without displaying raw server
+responses, passwords or tokens.
+
+### Improved in 0.3.8
+
+Forecast-time checks run locally before downloading, with options when the
+selected duration or intervals cannot be supplied. Weather, waves and currents
+retain their independent native intervals. Sources without a usable common
+UTC period require a decision; valid partial coverage produces a completion
+note and keeps all records. Changing settings is the default choice, so a
+forecast is never shortened or a source omitted without an explicit selection.
+
+Extended forecasts assess preferred and fallback sources together. Equivalent
+Met Office and GFS mean sea-level pressure fields share one coverage timeline,
+preventing an unnecessary restriction to the shorter forecast. These checks
+use the shared generator on desktop and Android and retain the improved
+dateline and UTC handling described below.
+
+### Improved in 0.3.7
+
+Date-line downloads and generation use a consistent eastward interpretation
+across supported providers. Enter west greater than east, for example
+**W=170, E=-170**, to select the 20-degree Pacific strip. The chart-area selector, saved areas and size estimates use the
+same eastward interpretation. Output fields have continuous longitude columns
+and can be sampled on either side of 180 degrees.
+
+This applies to every viable combination of GFS (including hosted failover),
+ECMWF IFS/AIFS, GFS/Copernicus global waves, Copernicus global currents, TPXO,
+XTD and suitable imported GRIB/NetCDF data. Providers retain their native grids,
+fields and forecast cadence. Imported regular latitude/longitude fragments are
+stitched by field, level, cycle and valid time before combination; gaps and
+conflicting seam values fail explicitly. Timeline interpolation also handles
+longitude-convention and resolution changes at forecast handovers.
+
+Forecast timestamps stay in UTC across the date line: different local
+calendar dates never add or subtract a day from a field. NetCDF origins with
+positive or negative UTC offsets are normalized before selection; unsupported
+noncivil calendars fail explicitly. Midnight, year-end and leap-day tests
+verify GRIB1 currents and GRIB2 weather/waves retain the same valid times.
+If weather/current coverage does not overlap, the shared merge error shows
+both UTC ranges and explains how to change duration or current start time.
+Global ARCO readers support both padded and clipped boundary chunks so that
+Copernicus currents and waves retain western cells next to the longitude seam.
+
+Regional sources still require genuine geographical coverage: a Pacific box
+cannot be supplied by UKV, Nordic, ICON-EU, the exposed HRRR/RTOFS regions or
+European coastal-current products. Selecting an uncovered source produces a
+coverage error. Hosted GFS failover retains the cache's existing field support.
+
+### New in 0.3.6
+
+GFS weather and waves automatically switch from NOAA NOMADS to the hosted
+regional service at `https://grib.agentracert.com` when NOAA cannot be reached,
+returns a rate-limit response, or has a service outage. Successful timesteps
+are retained; the service supplies only the remainder at the same forecast
+cycle and native 0.25-degree grid. The client verifies the result checksum,
+field levels, times and geographical coverage before merging it.
+
+Failover requires no account or access-key setup. It sends the selected area
+to the hosted service, which reads its scheduled NOAA/AWS cache. The current
+cache supports **minimal/routing GFS weather and GFS waves**. Marine/all weather
+presets still require additional cached fields; xGRIB reports that limitation
+and never removes requested fields. Ordinary missing forecast files retain
+the existing cycle-selection behaviour. Other providers are unchanged.
+
+### Fixed in 0.3.5
+
+Opening the Android weather panel no longer queries an empty wxQt button
+bitmap. Action buttons measure the source icon, preserving their translated
+labels and avoiding the startup crash. Forecast generator source menus now
+use the same touch-sized rows as the UTC time picker and support touch scrolling.
+Android shutdown also finishes deferred Qt widget destruction before a plugin
+replacement unloads the library.
 
 ### New in 0.3
 
@@ -24,8 +108,7 @@ Tonga and elsewhere across the longitude seam. The shared GRIB coverage check
 uses the grid width and scanning direction, so global fields and regional
 fields crossing 180 degrees retain their true coverage. This also applies to
 other providers and imported regular latitude/longitude GRIBs, with or without
-waves. Truly disjoint weather/current areas are still rejected. Request boxes
-which themselves cross the antimeridian remain unsupported.
+waves. Truly disjoint weather/current areas are still rejected.
 
 ### Added in 0.2.5.2
 
@@ -186,6 +269,16 @@ cmake --preset linux-release
 cmake --build --preset linux-release-build
 ctest --preset linux-release-test
 ```
+
+For an optimized build with debugging symbols, use the corresponding
+`linux-relwithdebinfo`, `macos-arm64-relwithdebinfo` or
+`windows-plugin-x86-relwithdebinfo` preset and its `-build` / `-test` presets.
+Windows retains the staged x64 helper specified by `XGRIB_GENERATOR_STAGE`;
+debugging the helper itself requires building that helper with symbols too.
+
+A development launcher can set `XGRIB_PLUGIN_DATA_DIR` to its installed
+`share/opencpn/plugins/xgrib_pi` directory to keep resources and the helper
+paired with its plugin library despite an older per-user installation.
 
 Before pushing shared source, CMake, dependency, metadata or packaging changes,
 run the clean end-to-end local preflight:

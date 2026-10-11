@@ -31,6 +31,8 @@ private:
   void OnCheckTpxoModel(wxCommandEvent& event);
   void OnPrepareTpxoCache(wxCommandEvent& event);
   void OnGenerate(wxCommandEvent& event);
+  bool ValidateAreaInput();
+  bool ChooseTimeOptions(const wxString& issue_json);
   void OnBrowseOutput(wxCommandEvent& event);
   void OnOutputFilenameChanged(wxCommandEvent& event);
   void OnExistingGribFileChanged(wxFileDirPickerEvent& event);
@@ -58,7 +60,8 @@ private:
                    const wxString& prefix);
   void StartCommand(const wxString& command, const wxString& password,
                     bool generation);
-  void FinishCommand(long exit_code, bool launched);
+  void FinishCommand(long exit_code, bool launched,
+                     bool completion_notified = false);
   bool ChildProcessStillExists() const;
   bool OutputFileLooksValidGrib(wxString* details = nullptr) const;
   void SetBusy(bool busy);
@@ -73,7 +76,6 @@ private:
   bool ConfirmLargeCopernicusRequest();
   bool ValidateUkvRequest();
   bool ValidateMetNoRequest();
-  bool ValidateEcmwfRequest();
   bool AutoWouldUseMarineIe() const;
   bool NeedsCopernicusCredentials() const;
   bool IsOfflineTidalSelected() const;
@@ -174,6 +176,7 @@ private:
   wxCheckBox* m_openAfter;
   wxCheckBox* m_showMergeInstructions;
   wxTextCtrl* m_log;
+  wxStaticText* m_processStatus;
   wxTimer m_processTimer;
   wxTimer m_estimateTimer;
   wxStaticText* m_estimateSummary{nullptr};
@@ -183,6 +186,9 @@ private:
   unsigned long m_runningEstimateRevision{0};
   wxString m_estimateJobPath;
   wxString m_estimateOutput;
+  wxString m_timeSettingsIssue;
+  unsigned long m_timeSettingsRevision{0};
+  wxString m_timePolicy{"review"};
   wxString m_estimateDecoded;
   wxString m_estimateFile;
   wxString m_lastEstimateRequest;
@@ -192,6 +198,7 @@ private:
   bool m_processGeneration{false};
   bool m_processCancelled{false};
   long m_processPid{0};
+  wxLongLong m_processStarted;
   bool m_hasCurrentViewPort{false};
   PlugIn_ViewPort m_currentViewPort{};
   wxString m_currentCommand;
